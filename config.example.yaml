@@ -2,8 +2,11 @@
 #
 # Guidelines:
 # - Copy this file to `config.yaml` and customize it for your environment
-# - The default path of this configuration file is `config.yaml` in the current working directory.
-#   However you can change it using the `DEER_FLOW_CONFIG_PATH` environment variable.
+# - The default path of this configuration file is `config.yaml` in the project root.
+#   You can set `DEER_FLOW_PROJECT_ROOT` to define that root explicitly, or use
+#   `DEER_FLOW_CONFIG_PATH` to point at a specific config file.
+# - Runtime state defaults to `.deer-flow` under the project root. Override it
+#   with `DEER_FLOW_HOME` when you need a different writable data directory.
 # - Environment variables are available for all field values. Example: `api_key: $OPENAI_API_KEY`
 # - The `use` path is a string that looks like "package_name.sub_package_name.module_name:class_name/variable_name".
 
@@ -12,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 8
+config_version: 9
 
 # ============================================================================
 # Logging
@@ -27,7 +30,7 @@ log_level: info
 # When enabled, DeerFlow records input/output/total tokens per model call
 # and shows usage metadata in the workspace UI when providers return it.
 token_usage:
-  enabled: false
+  enabled: true
 
 # ============================================================================
 # Models Configuration
@@ -370,6 +373,16 @@ tools:
     use: deerflow.community.ddg_search.tools:web_search_tool
     max_results: 5
 
+  # Web search tool (uses Serper - Google Search API, requires SERPER_API_KEY)
+  # Serper provides real-time Google Search results. Sign up at https://serper.dev
+  # Note: set SERPER_API_KEY in your environment before starting the app, or
+  # uncomment and fill in api_key below (the $VAR syntax is resolved at startup).
+  # - name: web_search
+  #   group: web
+  #   use: deerflow.community.serper.tools:web_search_tool
+  #   max_results: 5
+  #   # api_key: $SERPER_API_KEY  # Optional if SERPER_API_KEY env var is set
+
   # Web search tool (requires Tavily API key)
   # - name: web_search
   #   group: web
@@ -494,6 +507,29 @@ tool_search:
   enabled: false
 
 # ============================================================================
+# Loop Detection Configuration
+# ============================================================================
+# Detect and interrupt repeated identical tool-call loops.
+# Frequency thresholds are safety limits for repeated use of the same tool type.
+
+loop_detection:
+  enabled: true
+  warn_threshold: 3
+  hard_limit: 5
+  window_size: 20
+  max_tracked_threads: 100
+  tool_freq_warn: 30
+  tool_freq_hard_limit: 50
+  # Per-tool overrides for tool_freq_warn / tool_freq_hard_limit. Values can be
+  # higher or lower than the global defaults. Commonly used to raise thresholds
+  # for high-frequency tools like bash in batch workflows (e.g. RNA-seq pipelines)
+  # without weakening protection on every other tool.
+  # tool_freq_overrides:
+  #   bash:
+  #     warn: 150
+  #     hard_limit: 300
+
+# ============================================================================
 # Sandbox Configuration
 # ============================================================================
 # Choose between local sandbox (direct execution) or Docker-based AIO sandbox
@@ -501,6 +537,11 @@ tool_search:
 # Option 1: Local Sandbox (Default)
 # Executes commands directly on the host machine
 uploads:
+  # Application-level upload limits enforced by the gateway and exposed to the
+  # frontend before file selection.
+  max_files: 10
+  max_file_size: 52428800    # 50 MiB
+  max_total_size: 104857600  # 100 MiB
   # Automatic Office/PDF conversion runs on the backend host before sandbox
   # isolation applies. Keep this disabled unless uploads come from a fully
   # trusted source and you intentionally accept host-side parser risk.
@@ -673,7 +714,8 @@ sandbox:
 
 skills:
   # Path to skills directory on the host (relative to project root or absolute)
-  # Default: ../skills (relative to backend directory)
+  # Default: skills under the project root
+  # Override with DEER_FLOW_SKILLS_PATH when this field is omitted.
   # Uncomment to customize:
   # path: /absolute/path/to/custom/skills
 
@@ -829,9 +871,25 @@ skill_evolution:
 #
 # Postgres mode: put your connection URL in .env as DATABASE_URL,
 # then reference it here with $DATABASE_URL.
-# Install the driver first:
-#   Local:  uv sync --extra postgres
-#   Docker: UV_EXTRAS=postgres docker compose build
+#
+# Install the driver — Issue #2754 fix lands `UV_EXTRAS` in every code path:
+#   Local      `make dev` auto-detects from `database.backend: postgres` below
+#              and passes `--extra postgres` to `uv sync` on every restart, so
+#              the extra is no longer wiped. To opt in explicitly (or layer
+#              extras like `postgres,ollama`), set in project-root .env:
+#                  UV_EXTRAS=postgres
+#   Docker dev `make docker-start` reads `UV_EXTRAS` from project-root .env via
+#              `env_file`. Set:
+#                  UV_EXTRAS=postgres
+#              Multiple extras (`postgres,ollama`) supported here too — see
+#              docker/dev-entrypoint.sh.
+#   Docker img build-arg `UV_EXTRAS=postgres docker compose build` — single
+#              extra only at build time (backend/Dockerfile passes the value
+#              as one token to `--extra`).
+#
+# First-time bootstrap (before `make dev`):
+#   cd backend && uv sync --all-packages --extra postgres
+#   (--all-packages propagates the extra into workspace members — see PR #2584)
 #
 # NOTE: When both `checkpointer` and `database` are configured,
 # `checkpointer` takes precedence for LangGraph state persistence.
@@ -964,6 +1022,13 @@ run_events:
 #     enabled: false
 #     bot_id: $WECOM_BOT_ID
 #     bot_secret: $WECOM_BOT_SECRET
+#
+#   dingtalk:
+#     enabled: false
+#     client_id: $DINGTALK_CLIENT_ID
+#     client_secret: $DINGTALK_CLIENT_SECRET
+#     allowed_users: []               # empty = allow all
+#     card_template_id: ""            # Optional: AI Card template ID for streaming updates
 
 # ============================================================================
 # Guardrails Configuration

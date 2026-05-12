@@ -38,6 +38,7 @@ STREAM_UPDATE_MIN_INTERVAL_SECONDS = 0.35
 THREAD_BUSY_MESSAGE = "This conversation is already processing another request. Please wait for it to finish and try again."
 
 CHANNEL_CAPABILITIES = {
+    "dingtalk": {"supports_streaming": False},
     "discord": {"supports_streaming": False},
     "feishu": {"supports_streaming": True},
     "slack": {"supports_streaming": False},
@@ -47,6 +48,13 @@ CHANNEL_CAPABILITIES = {
 }
 
 InboundFileReader = Callable[[dict[str, Any], httpx.AsyncClient], Awaitable[bytes | None]]
+
+_METADATA_DROP_KEYS = frozenset({"raw_message", "ref_msg"})
+
+
+def _slim_metadata(meta: dict[str, Any]) -> dict[str, Any]:
+    """Return a shallow copy of *meta* with known-large keys removed."""
+    return {k: v for k, v in meta.items() if k not in _METADATA_DROP_KEYS}
 
 
 INBOUND_FILE_READERS: dict[str, InboundFileReader] = {}
@@ -138,6 +146,13 @@ def _normalize_custom_agent_name(raw_value: str) -> str:
     return normalized
 
 
+def _strip_loop_warning_text(text: str) -> str:
+    """Remove middleware-authored loop warning lines from display text."""
+    if "[LOOP DETECTED]" not in text:
+        return text
+    return "\n".join(line for line in text.splitlines() if "[LOOP DETECTED]" not in line).strip()
+
+
 def _extract_response_text(result: dict | list) -> str:
     """Extract the last AI message text from a LangGraph runs.wait result.
 
@@ -147,7 +162,7 @@ def _extract_response_text(result: dict | list) -> str:
     Handles special cases:
     - Regular AI text responses
     - Clarification interrupts (``ask_clarification`` tool messages)
-    - AI messages with tool_calls but no text content
+    - Strips loop-detection warnings attached to tool-call AI messages
     """
     if isinstance(result, list):
         messages = result
@@ -177,7 +192,12 @@ def _extract_response_text(result: dict | list) -> str:
         # Regular AI message with text content
         if msg_type == "ai":
             content = msg.get("content", "")
+            has_tool_calls = bool(msg.get("tool_calls"))
             if isinstance(content, str) and content:
+                if has_tool_calls:
+                    content = _strip_loop_warning_text(content)
+                    if not content:
+                        continue
                 return content
             # content can be a list of content blocks
             if isinstance(content, list):
@@ -188,6 +208,8 @@ def _extract_response_text(result: dict | list) -> str:
                     elif isinstance(block, str):
                         parts.append(block)
                 text = "".join(parts)
+                if has_tool_calls:
+                    text = _strip_loop_warning_text(text)
                 if text:
                     return text
     return ""
@@ -412,7 +434,13 @@ async def _ingest_inbound_files(thread_id: str, msg: InboundMessage) -> list[dic
     if not msg.files:
         return []
 
-    from deerflow.uploads.manager import claim_unique_filename, ensure_uploads_dir, normalize_filename
+    from deerflow.uploads.manager import (
+        UnsafeUploadPathError,
+        claim_unique_filename,
+        ensure_uploads_dir,
+        normalize_filename,
+        write_upload_file_no_symlink,
+    )
 
     uploads_dir = ensure_uploads_dir(thread_id)
     seen_names = {entry.name for entry in uploads_dir.iterdir() if entry.is_file()}
@@ -463,7 +491,10 @@ async def _ingest_inbound_files(thread_id: str, msg: InboundMessage) -> list[dic
 
             dest = uploads_dir / safe_name
             try:
-                dest.write_bytes(data)
+                dest = write_upload_file_no_symlink(uploads_dir, safe_name, data)
+            except UnsafeUploadPathError:
+                logger.warning("[Manager] skipping inbound file with unsafe destination: %s", safe_name)
+                continue
             except Exception:
                 logger.exception("[Manager] failed to write inbound file: %s", dest)
                 continue
@@ -543,6 +574,13 @@ class ChannelManager:
 
     @staticmethod
     def _channel_supports_streaming(channel_name: str) -> bool:
+        from .service import get_channel_service
+
+        service = get_channel_service()
+        if service:
+            channel = service.get_channel(channel_name)
+            if channel is not None:
+                return channel.supports_streaming
         return CHANNEL_CAPABILITIES.get(channel_name, {}).get("supports_streaming", False)
 
     def _resolve_session_layer(self, msg: InboundMessage) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -564,6 +602,17 @@ class ChannelManager:
             channel_layer.get("config"),
             user_layer.get("config"),
         )
+
+        configurable = run_config.get("configurable")
+        if isinstance(configurable, Mapping):
+            configurable = dict(configurable)
+        else:
+            configurable = {}
+        run_config["configurable"] = configurable
+        # Pin channel-triggered runs to the root graph namespace so follow-up
+        # turns continue from the same conversation checkpoint.
+        configurable["checkpoint_ns"] = ""
+        configurable["thread_id"] = thread_id
 
         run_context = _merge_dicts(
             DEFAULT_RUN_CONTEXT,
@@ -772,6 +821,7 @@ class ChannelManager:
             artifacts=artifacts,
             attachments=attachments,
             thread_ts=msg.thread_ts,
+            metadata=_slim_metadata(msg.metadata),
         )
         logger.info("[Manager] publishing outbound message to bus: channel=%s, chat_id=%s", msg.channel_name, msg.chat_id)
         await self.bus.publish_outbound(outbound)
@@ -833,6 +883,7 @@ class ChannelManager:
                         text=latest_text,
                         is_final=False,
                         thread_ts=msg.thread_ts,
+                        metadata=_slim_metadata(msg.metadata),
                     )
                 )
                 last_published_text = latest_text
@@ -877,6 +928,7 @@ class ChannelManager:
                     attachments=attachments,
                     is_final=True,
                     thread_ts=msg.thread_ts,
+                    metadata=_slim_metadata(msg.metadata),
                 )
             )
 
@@ -935,6 +987,7 @@ class ChannelManager:
             thread_id=self.store.get_thread_id(msg.channel_name, msg.chat_id) or "",
             text=reply,
             thread_ts=msg.thread_ts,
+            metadata=_slim_metadata(msg.metadata),
         )
         await self.bus.publish_outbound(outbound)
 
@@ -944,7 +997,11 @@ class ChannelManager:
 
         try:
             async with httpx.AsyncClient() as http:
-                resp = await http.get(f"{self._gateway_url}{path}", timeout=10)
+                resp = await http.get(
+                    f"{self._gateway_url}{path}",
+                    timeout=10,
+                    headers=create_internal_auth_headers(),
+                )
                 resp.raise_for_status()
                 data = resp.json()
         except Exception:
@@ -968,5 +1025,6 @@ class ChannelManager:
             thread_id=self.store.get_thread_id(msg.channel_name, msg.chat_id) or "",
             text=error_text,
             thread_ts=msg.thread_ts,
+            metadata=_slim_metadata(msg.metadata),
         )
         await self.bus.publish_outbound(outbound)

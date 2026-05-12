@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -9,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.gateway.auth_middleware import AuthMiddleware
 from app.gateway.config import get_gateway_config
-from app.gateway.csrf_middleware import CSRFMiddleware
+from app.gateway.csrf_middleware import CSRFMiddleware, get_configured_cors_origins
 from app.gateway.deps import langgraph_runtime
 from app.gateway.routers import (
     agents,
@@ -29,11 +28,12 @@ from app.gateway.routers import (
     uploads,
 )
 from deerflow.config import app_config as deerflow_app_config
+from deerflow.config.app_config import apply_logging_level
 
 AppConfig = deerflow_app_config.AppConfig
 get_app_config = deerflow_app_config.get_app_config
 
-# Configure logging
+# Default logging; lifespan overrides from config.yaml log_level.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -164,6 +164,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Load config and check necessary environment variables at startup
     try:
         app.state.config = get_app_config()
+        apply_logging_level(app.state.config.log_level)
         logger.info("Configuration loaded successfully")
     except Exception as e:
         error_msg = f"Failed to load configuration during gateway startup: {e}"
@@ -216,6 +217,10 @@ def create_app() -> FastAPI:
     Returns:
         Configured FastAPI application instance.
     """
+    config = get_gateway_config()
+    docs_url = "/docs" if config.enable_docs else None
+    redoc_url = "/redoc" if config.enable_docs else None
+    openapi_url = "/openapi.json" if config.enable_docs else None
 
     app = FastAPI(
         title="DeerFlow API Gateway",
@@ -235,14 +240,14 @@ API Gateway for DeerFlow - A LangGraph-based AI agent backend with sandbox execu
 
 ### Architecture
 
-LangGraph requests are handled by nginx reverse proxy.
-This gateway provides custom endpoints for models, MCP configuration, skills, and artifacts.
+LangGraph-compatible requests are routed through nginx to this gateway.
+This gateway provides runtime endpoints for agent runs plus custom endpoints for models, MCP configuration, skills, and artifacts.
         """,
         version="0.1.0",
         lifespan=lifespan,
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
+        docs_url=docs_url,
+        redoc_url=redoc_url,
+        openapi_url=openapi_url,
         openapi_tags=[
             {
                 "name": "models",
@@ -305,25 +310,18 @@ This gateway provides custom endpoints for models, MCP configuration, skills, an
     # CSRF: Double Submit Cookie pattern for state-changing requests
     app.add_middleware(CSRFMiddleware)
 
-    # CORS: when GATEWAY_CORS_ORIGINS is set (dev without nginx), add CORS middleware.
-    # In production, nginx handles CORS and no middleware is needed.
-    cors_origins_env = os.environ.get("GATEWAY_CORS_ORIGINS", "")
-    if cors_origins_env:
-        cors_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
-        # Validate: wildcard origin with credentials is a security misconfiguration
-        for origin in cors_origins:
-            if origin == "*":
-                logger.error("GATEWAY_CORS_ORIGINS contains wildcard '*' with allow_credentials=True. This is a security misconfiguration — browsers will reject the response. Use explicit scheme://host:port origins instead.")
-                cors_origins = [o for o in cors_origins if o != "*"]
-                break
-        if cors_origins:
-            app.add_middleware(
-                CORSMiddleware,
-                allow_origins=cors_origins,
-                allow_credentials=True,
-                allow_methods=["*"],
-                allow_headers=["*"],
-            )
+    # CORS: the unified nginx endpoint is same-origin by default. Split-origin
+    # browser clients must opt in with this explicit Gateway allowlist so CORS
+    # and CSRF origin checks share the same source of truth.
+    cors_origins = sorted(get_configured_cors_origins())
+    if cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
     # Include routers
     # Models API is mounted at /api/models
@@ -372,7 +370,7 @@ This gateway provides custom endpoints for models, MCP configuration, skills, an
     app.include_router(runs.router)
 
     @app.get("/health", tags=["health"])
-    async def health_check() -> dict:
+    async def health_check() -> dict[str, str]:
         """Health check endpoint.
 
         Returns:
